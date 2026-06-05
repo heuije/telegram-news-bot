@@ -763,7 +763,7 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"📈 글로벌 주요 지수\n조회시각: {now_kst} KST\n\n"
     for flag, name, ticker in UPDATE_INDICES:
         msg += get_index_row(flag, name, ticker)
-    msg += "\n↳ 출처: yfinance (지수 실시간, 전일 종가 대비)"
+    msg += "\n↳ Source: yfinance (지수 실시간, 전일 종가 대비)"
     await update.message.reply_text(msg)
 
 
@@ -1120,7 +1120,7 @@ def _format_mineral_row(item):
         source = item.get("source", "") if item else ""
         line = f"{emoji} {label}: {text}\n"
         if source:
-            line += f"   ↳ {source}\n"
+            line += f"   ↳ Source: {source}\n"
         return line
     label = item["label"]
     value = item["value"]
@@ -1161,7 +1161,7 @@ def _format_mineral_row(item):
     else:
         value_str = f"{value:.3f}"
 
-    return f"{arrow} {label}: {value_str} {unit}{change_str}{time_tag}\n   ↳ {source}\n"
+    return f"{arrow} {label}: {value_str} {unit}{change_str}{time_tag}\n   ↳ Source: {source}\n"
 
 
 async def mineral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1289,7 +1289,7 @@ async def rate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 라벨 폭 맞춤
         pad = "  " if len(label) < 4 else ""
         msg += f"{arrow} {label}{pad}: {y:>5.2f}%  ({sign}{bp}bp)\n"
-    msg += "\n출처: U.S. Department of the Treasury (일별 종가)"
+    msg += "\nSource: U.S. Department of the Treasury (일별 종가)"
 
     await update.message.reply_text(msg)
 
