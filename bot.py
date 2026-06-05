@@ -734,12 +734,13 @@ UPDATE_INDICES = [
 
 
 def get_index_row(flag, name, ticker):
-    """지수 한 줄: 국기 + 이름 + 현재값 + 전일 대비 변동률."""
+    """지수 한 줄 + 급변 알람: (row, alert) 반환.
+    전일 대비 |변동률| >= 5%면 alert 문자열, 아니면 None."""
     try:
         hist = yf.Ticker(ticker).history(period="5d")
         hist = hist.dropna(subset=["Close"])
         if len(hist) < 2:
-            return f"❓ {flag} {name}: 데이터 없음\n"
+            return f"❓ {flag} {name}: 데이터 없음\n", None
         cur = float(hist["Close"].iloc[-1])
         prev = float(hist["Close"].iloc[-2])
         chg = (cur - prev) / prev * 100
@@ -750,10 +751,15 @@ def get_index_row(flag, name, ticker):
             arrow = "▼"
         else:
             arrow = "▬"
-        return f"{flag} {arrow} {name}: {cur:,.2f} ({sign}{chg:.2f}%)\n"
+        row = f"{flag} {arrow} {name}: {cur:,.2f} ({sign}{chg:.2f}%)\n"
+        alert = None
+        if abs(chg) >= 5:
+            direction = "🔺 급등" if chg > 0 else "▼ 급락"
+            alert = f"{direction} {flag} {name} {round(chg, 2)}% 변동!"
+        return row, alert
     except Exception as e:
         print(f"  ⚠️ {name} 지수 오류: {e}")
-        return f"❓ {flag} {name}: 조회 실패\n"
+        return f"❓ {flag} {name}: 조회 실패\n", None
 
 
 async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -761,10 +767,16 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ 글로벌 지수 조회 중...")
     now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     msg = f"📈 글로벌 주요 지수\n조회시각: {now_kst} KST\n\n"
+    alerts = []
     for flag, name, ticker in UPDATE_INDICES:
-        msg += get_index_row(flag, name, ticker)
+        row, alert = get_index_row(flag, name, ticker)
+        msg += row
+        if alert:
+            alerts.append(alert)
     msg += "\n↳ Source: yfinance (지수 실시간, 전일 종가 대비)"
     await update.message.reply_text(msg)
+    for alert in alerts:
+        await update.message.reply_text(f"⚠️ 가격 급변 알람\n{alert}")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1110,6 +1122,20 @@ def _is_gfex_trading_hours():
     return any(start <= minutes < end for start, end in sessions)
 
 
+def collect_surge_alerts(items, threshold=5.0):
+    """item dict 리스트에서 전일 대비 |변동률| >= threshold(%)인 항목을
+    기존 양식의 급변 알람 문자열 리스트로 반환."""
+    alerts = []
+    for it in items:
+        if not it:
+            continue
+        cp = it.get("change_pct")
+        if cp is not None and abs(cp) >= threshold:
+            direction = "🔺 급등" if cp > 0 else "▼ 급락"
+            alerts.append(f"{direction} {it['label']} {round(cp, 2)}% 변동!")
+    return alerts
+
+
 def _format_mineral_row(item):
     """광물 한 항목을 메시지 한 줄로 포맷팅.
     item에 status_emoji / status_text 키가 있으면 None 표시 시 사용."""
@@ -1227,6 +1253,8 @@ async def mineral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += _format_mineral_row(item)
 
     await update.message.reply_text(msg)
+    for alert in collect_surge_alerts(items + metals):
+        await update.message.reply_text(f"⚠️ 가격 급변 알람\n{alert}")
 
 
 async def oil_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1255,6 +1283,36 @@ async def oil_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += _format_mineral_row(item)
 
     await update.message.reply_text(msg)
+    for alert in collect_surge_alerts(items):
+        await update.message.reply_text(f"⚠️ 가격 급변 알람\n{alert}")
+
+
+async def check_threshold_alerts():
+    """자동 모니터링: 글로벌 지수(/update) + 광물(/mineral) + 유가(/oil)를
+    조회해 전일 대비 5% 이상 변동 항목을 급변 알람으로 자동 발송."""
+    alerts = []
+    # 지수 7종
+    for flag, name, ticker in UPDATE_INDICES:
+        _, alert = get_index_row(flag, name, ticker)
+        if alert:
+            alerts.append(alert)
+    # 광물/귀금속 5종 + 유가 2종
+    items = [
+        fetch_lithium_carbonate_eastmoney(),
+        fetch_yf_commodity("구리 선물", "HG=F", "$/lb"),
+        fetch_tradingeconomics_metal("nickel", "니켈 선물"),
+        fetch_yf_commodity("금 선물", "GC=F", "$/oz"),
+        fetch_yf_commodity("은 선물", "SI=F", "$/oz"),
+        (fetch_oilprice_crude(["wti", "wti-crude"], "WTI Crude")
+         or fetch_yf_commodity("WTI Crude (CL=F)", "CL=F", "$/bbl")),
+        (fetch_oilprice_crude(["brent", "brent-crude", "brent-oil"], "Brent Crude")
+         or fetch_yf_commodity("Brent Crude (BZ=F)", "BZ=F", "$/bbl")),
+    ]
+    alerts += collect_surge_alerts(items)
+    for alert in alerts:
+        await bot.send_message(chat_id=CHAT_ID, text=f"⚠️ 가격 급변 알람\n{alert}")
+    now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    print(f"[{now_kst}] 급변 알람 체크 완료: {len(alerts)}건")
 
 
 async def rate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1369,6 +1427,7 @@ async def main():
 
             if news_counter >= 18:
                 await check_prices()
+                await check_threshold_alerts()
                 news_counter = 0
 
         await app.updater.stop()
