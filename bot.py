@@ -921,6 +921,38 @@ def fetch_oilprice_crude(slug_candidates, label):
     return None
 
 
+def fetch_oil_12h_change(ticker):
+    """yfinance 시간봉으로 12시간 전 대비 증감률(%) 계산. 없으면 None.
+    원유 선물(CL=F/BZ=F)은 거의 24시간 거래라 12시간 전 봉을 찾을 수 있음."""
+    try:
+        hist = yf.Ticker(ticker).history(period="3d", interval="1h")
+        hist = hist.dropna(subset=["Close"])
+        if len(hist) < 2:
+            return None
+        cur = float(hist["Close"].iloc[-1])
+        target = hist.index[-1] - timedelta(hours=12)
+        past = hist[hist.index <= target]
+        ref = float(past["Close"].iloc[-1]) if not past.empty else float(hist["Close"].iloc[0])
+        if not ref:
+            return None
+        return (cur - ref) / ref * 100
+    except Exception as e:
+        print(f"  ⚠️ {ticker} 12h 증감률 오류: {e}")
+        return None
+
+
+def get_oil_item(slug_candidates, yf_ticker, label):
+    """유가 item: 가격은 oilprice.com(실패 시 yfinance), 증감률은 12시간 전 대비(yfinance 시간봉)."""
+    item = (
+        fetch_oilprice_crude(slug_candidates, label)
+        or fetch_yf_commodity(label, yf_ticker, "$/bbl")
+        or {"label": label, "value": None, "unit": "", "source": "조회 실패"}
+    )
+    # change_pct를 12시간 전 대비로 덮어씀 (oilprice는 None, yfinance는 전일대비였음)
+    item["change_pct"] = fetch_oil_12h_change(yf_ticker)
+    return item
+
+
 def fetch_yf_commodity(label, ticker, unit):
     """yfinance 상품 가격 + 전일 대비 변동률."""
     try:
@@ -1190,6 +1222,23 @@ def _format_mineral_row(item):
     return f"{arrow} {label}: {value_str} {unit}{change_str}{time_tag}\n   ↳ Source: {source}\n"
 
 
+def _format_oil_row(item):
+    """유가 한 줄: 🛢️ + 가격 + (±x.xx%) 12시간 전 대비. 등락 이모티콘(🔺/▼) 미사용."""
+    label = item["label"]
+    value = item.get("value")
+    source = item.get("source", "")
+    if value is None:
+        return f"🛢️ {label}: 데이터 없음\n   ↳ Source: {source}\n"
+    unit = item.get("unit", "$/bbl")
+    cp = item.get("change_pct")
+    if cp is not None:
+        sign = "+" if cp >= 0 else ""
+        change_str = f"  ({sign}{cp:.2f}%)"
+    else:
+        change_str = ""
+    return f"🛢️ {label}: {value:,.2f} {unit}{change_str}\n   ↳ Source: {source}\n"
+
+
 async def mineral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """광물 선물가격 조회 (탄산리튬·구리·니켈)"""
     await update.message.reply_text("⏳ 광물 선물 시세 조회 중... (5~10초)")
@@ -1258,29 +1307,20 @@ async def mineral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def oil_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """국제 유가 조회 (WTI·Brent)"""
+    """국제 유가 조회 (WTI·Brent) — 12시간 전 대비 증감률"""
     await update.message.reply_text("⏳ 국제 유가 조회 중...")
 
-    items = []
-
-    # WTI Crude — oilprice.com 고정, 실패 시 yfinance
-    items.append(
-        fetch_oilprice_crude(["wti", "wti-crude"], "WTI Crude")
-        or fetch_yf_commodity("WTI Crude (CL=F)", "CL=F", "$/bbl")
-        or {"label": "WTI Crude", "value": None, "unit": "", "source": "조회 실패"}
-    )
-
-    # Brent Crude — oilprice.com 고정, 실패 시 yfinance
-    items.append(
-        fetch_oilprice_crude(["brent", "brent-crude", "brent-oil"], "Brent Crude")
-        or fetch_yf_commodity("Brent Crude (BZ=F)", "BZ=F", "$/bbl")
-        or {"label": "Brent Crude", "value": None, "unit": "", "source": "조회 실패"}
-    )
+    # 가격은 oilprice.com(실패 시 yfinance), 증감률은 12시간 전 대비
+    items = [
+        get_oil_item(["wti", "wti-crude"], "CL=F", "WTI Crude"),
+        get_oil_item(["brent", "brent-crude", "brent-oil"], "BZ=F", "Brent Crude"),
+    ]
 
     now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     msg = f"🛢️ 국제 유가\n조회시각: {now_kst} KST\n\n"
     for item in items:
-        msg += _format_mineral_row(item)
+        msg += _format_oil_row(item)
+    msg += "\nNote: 12시간 전 대비 증감률"
 
     await update.message.reply_text(msg)
     for alert in collect_surge_alerts(items):
@@ -1303,10 +1343,8 @@ async def check_threshold_alerts():
         fetch_tradingeconomics_metal("nickel", "니켈 선물"),
         fetch_yf_commodity("금 선물", "GC=F", "$/oz"),
         fetch_yf_commodity("은 선물", "SI=F", "$/oz"),
-        (fetch_oilprice_crude(["wti", "wti-crude"], "WTI Crude")
-         or fetch_yf_commodity("WTI Crude (CL=F)", "CL=F", "$/bbl")),
-        (fetch_oilprice_crude(["brent", "brent-crude", "brent-oil"], "Brent Crude")
-         or fetch_yf_commodity("Brent Crude (BZ=F)", "BZ=F", "$/bbl")),
+        get_oil_item(["wti", "wti-crude"], "CL=F", "WTI Crude"),       # 유가는 12h 전 대비
+        get_oil_item(["brent", "brent-crude", "brent-oil"], "BZ=F", "Brent Crude"),
     ]
     alerts += collect_surge_alerts(items)
     for alert in alerts:
