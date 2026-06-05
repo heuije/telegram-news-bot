@@ -785,7 +785,7 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
-# 광물·원자재 가격 (/mineral 명령어)
+# 광물 선물가격 (/mineral) + 국제 유가 (/oil) 명령어
 # ─────────────────────────────────────────────
 def fetch_lithium_carbonate_eastmoney():
     """탄산리튬 주력 계약 가격 - eastmoney (광저우선물거래소 m:225).
@@ -820,7 +820,7 @@ def fetch_lithium_carbonate_eastmoney():
             if change_pct is not None:
                 change_pct = change_pct / 100
             return {
-                "label": f"탄산리튬 {code} (GFEX 주력)",
+                "label": f"탄산리튬 {code} (중국 탄산리튬 선물가격)",
                 "value": price,
                 "unit": "¥/t",
                 "change_pct": change_pct,
@@ -1121,18 +1121,18 @@ def _format_mineral_row(item):
 
 
 async def mineral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """광물·원자재 7종 실시간 가격 조회"""
-    await update.message.reply_text("⏳ 광물·원자재 시세 조회 중... (5~10초)")
+    """광물 선물가격 조회 (탄산리튬·구리·니켈)"""
+    await update.message.reply_text("⏳ 광물 선물 시세 조회 중... (5~10초)")
 
     items = []
 
-    # 1) 탄산리튬 (eastmoney 고정)
+    # 1) 탄산리튬 — eastmoney GFEX 주력 계약 (중국 탄산리튬 선물가격)
     li = fetch_lithium_carbonate_eastmoney()
     if li is None:
         if _is_gfex_trading_hours():
             # 거래시간인데 None → 실제 조회 실패
             li = {
-                "label": "탄산리튬 lc2605 (GFEX)",
+                "label": "탄산리튬 (중국 탄산리튬 선물가격)",
                 "value": None,
                 "unit": "",
                 "source": "eastmoney.com 일시 조회 실패",
@@ -1140,7 +1140,7 @@ async def mineral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             # 거래시간 외 → 거래소 휴장
             li = {
-                "label": "탄산리튬 lc2605 (GFEX)",
+                "label": "탄산리튬 (중국 탄산리튬 선물가격)",
                 "value": None,
                 "unit": "",
                 "source": "GFEX 거래시간: KST 10:30-12:30 / 14:30-16:00 / 22:00-24:00 (평일)",
@@ -1149,45 +1149,49 @@ async def mineral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
     items.append(li)
 
-    # 2) 구리 — yfinance COMEX (실시간)
-    items.append(fetch_yf_commodity("구리 (COMEX HG=F)", "HG=F", "$/lb"))
+    # 2) 구리 선물 — yfinance COMEX HG=F (investing.com Copper와 동일한 CME 구리 선물)
+    cu = fetch_yf_commodity("구리 선물", "HG=F", "$/lb")
+    if cu is None:
+        cu = {"label": "구리 선물", "value": None, "unit": "",
+              "source": "yfinance 일시 조회 실패"}
+    items.append(cu)
 
-    # 3) 니켈 — TradingEconomics
-    items.append(fetch_tradingeconomics_metal("nickel", "니켈 (LME)") or {
-        "label": "니켈 (LME)", "value": None, "unit": "",
+    # 3) 니켈 선물 — TradingEconomics LME (investing.com Nickel과 동일한 LME 니켈 선물)
+    items.append(fetch_tradingeconomics_metal("nickel", "니켈 선물") or {
+        "label": "니켈 선물", "value": None, "unit": "",
         "source": "tradingeconomics.com 일시 조회 실패",
     })
 
-    # 4) 코발트 — TradingEconomics (LME 코발트는 초저유동성이라 며칠씩 보합 흔함)
-    co = fetch_tradingeconomics_metal("cobalt", "코발트 (LME)")
-    if co is None:
-        co = {"label": "코발트 (LME)", "value": None, "unit": "",
-              "source": "거래량 적음 — 실시간 무료 소스 없음"}
-    elif co.get("change_pct") == 0.0:
-        # 보합일 때 저유동성임을 출처에 명시
-        co["source"] = "tradingeconomics.com (저유동성, 보합 잦음)"
-    items.append(co)
+    now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    msg = f"⛏️ 광물 선물가격\n조회시각: {now_kst} KST\n\n"
+    for item in items:
+        msg += _format_mineral_row(item)
 
-    # 5) 알루미늄 — TradingEconomics LME (yfinance ALI=F는 비유동이라 변동률 부정확)
-    items.append(
-        fetch_tradingeconomics_metal("aluminum", "알루미늄 (LME)")
-        or fetch_yf_commodity("알루미늄 (COMEX ALI=F)", "ALI=F", "$/t")
-    )
+    await update.message.reply_text(msg)
 
-    # 6) WTI Crude — oilprice.com 고정, 실패 시 yfinance
+
+async def oil_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """국제 유가 조회 (WTI·Brent)"""
+    await update.message.reply_text("⏳ 국제 유가 조회 중...")
+
+    items = []
+
+    # WTI Crude — oilprice.com 고정, 실패 시 yfinance
     items.append(
         fetch_oilprice_crude(["wti", "wti-crude"], "WTI Crude")
         or fetch_yf_commodity("WTI Crude (CL=F)", "CL=F", "$/bbl")
+        or {"label": "WTI Crude", "value": None, "unit": "", "source": "조회 실패"}
     )
 
-    # 7) Brent Crude — oilprice.com 고정, 실패 시 yfinance
+    # Brent Crude — oilprice.com 고정, 실패 시 yfinance
     items.append(
         fetch_oilprice_crude(["brent", "brent-crude", "brent-oil"], "Brent Crude")
         or fetch_yf_commodity("Brent Crude (BZ=F)", "BZ=F", "$/bbl")
+        or {"label": "Brent Crude", "value": None, "unit": "", "source": "조회 실패"}
     )
 
     now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-    msg = f"⛏️ 광물·원자재 가격\n조회시각: {now_kst} KST\n\n"
+    msg = f"🛢️ 국제 유가\n조회시각: {now_kst} KST\n\n"
     for item in items:
         msg += _format_mineral_row(item)
 
@@ -1289,6 +1293,8 @@ async def main():
     app.add_handler(CommandHandler("rate", rate_command))
     app.add_handler(CommandHandler("mineral", mineral_command))
     app.add_handler(CommandHandler("Mineral", mineral_command))
+    app.add_handler(CommandHandler("oil", oil_command))
+    app.add_handler(CommandHandler("Oil", oil_command))
     app.add_handler(CommandHandler("diag", diag_command))
 
     news_counter = 0
