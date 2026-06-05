@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import time
 from io import StringIO
 from pathlib import Path
 
@@ -719,10 +720,51 @@ def fetch_treasury_yields():
 # ─────────────────────────────────────────────
 # Telegram 커맨드 핸들러
 # ─────────────────────────────────────────────
+# /update 글로벌 지수 — (국기, 표시명, yfinance 티커)
+# investing.com은 Cloudflare로 서버 크롤링 불가 → 동일 지수를 yfinance로 조회
+UPDATE_INDICES = [
+    ("🇰🇷", "한국 (EWY)",            "EWY"),
+    ("🇺🇸", "S&P 500",              "^GSPC"),
+    ("🇺🇸", "나스닥 100",           "^NDX"),
+    ("🇺🇸", "다우존스",             "^DJI"),
+    ("🇯🇵", "일본 (Nikkei 225)",    "^N225"),
+    ("🇨🇳", "중국 (CSI 300)",       "000300.SS"),
+    ("🇪🇺", "EU (Euro Stoxx 50)",   "^STOXX50E"),
+]
+
+
+def get_index_row(flag, name, ticker):
+    """지수 한 줄: 국기 + 이름 + 현재값 + 전일 대비 변동률."""
+    try:
+        hist = yf.Ticker(ticker).history(period="5d")
+        hist = hist.dropna(subset=["Close"])
+        if len(hist) < 2:
+            return f"❓ {flag} {name}: 데이터 없음\n"
+        cur = float(hist["Close"].iloc[-1])
+        prev = float(hist["Close"].iloc[-2])
+        chg = (cur - prev) / prev * 100
+        sign = "+" if chg >= 0 else ""
+        if chg > 0:
+            arrow = "🔺"
+        elif chg < 0:
+            arrow = "▼"
+        else:
+            arrow = "▬"
+        return f"{flag} {arrow} {name}: {cur:,.2f} ({sign}{chg:.2f}%)\n"
+    except Exception as e:
+        print(f"  ⚠️ {name} 지수 오류: {e}")
+        return f"❓ {flag} {name}: 조회 실패\n"
+
+
 async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ 데이터 수집 중...")
-    await check_prices()
-    await check_feeds()
+    """글로벌 주요 지수 조회 (한국·미국·일본·중국·EU)"""
+    await update.message.reply_text("⏳ 글로벌 지수 조회 중...")
+    now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    msg = f"📈 글로벌 주요 지수\n조회시각: {now_kst} KST\n\n"
+    for flag, name, ticker in UPDATE_INDICES:
+        msg += get_index_row(flag, name, ticker)
+    msg += "\n↳ 출처: yfinance (지수 실시간, 전일 종가 대비)"
+    await update.message.reply_text(msg)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -798,7 +840,8 @@ def fetch_lithium_carbonate_eastmoney():
         "https://push2.eastmoney.com/api/qt/clist/get"
         "?fs=m:225&fields=f12,f14,f2,f3,f6&pn=1&pz=60"
     )
-    for attempt in range(2):  # 간헐 timeout 대비 1회 재시도
+    attempts = 4  # eastmoney 간헐적 빈 응답 대비 재시도
+    for attempt in range(attempts):
         try:
             r = requests.get(list_url, headers=em_headers, timeout=15)
             data = (r.json() or {}).get("data") or {}
@@ -828,9 +871,10 @@ def fetch_lithium_carbonate_eastmoney():
                 "is_realtime": True,
             }
         except Exception as e:
-            if attempt == 1:
+            if attempt == attempts - 1:
                 print(f"  ⚠️ 탄산리튬 조회 오류: {e}")
                 return None
+            time.sleep(0.6)  # eastmoney가 연속 요청 시 연결 끊는 경향 → 간격 두고 재시도
             continue
     return None
 
@@ -1162,9 +1206,24 @@ async def mineral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "source": "tradingeconomics.com 일시 조회 실패",
     })
 
+    # 귀금속 (니켈 아래 한 줄 띄우고 표시) — yfinance COMEX 선물
+    # investing.com Gold/Silver와 동일한 CME(COMEX) 금·은 선물
+    metals = []
+    metals.append(
+        fetch_yf_commodity("금 선물", "GC=F", "$/oz")
+        or {"label": "금 선물", "value": None, "unit": "", "source": "yfinance 일시 조회 실패"}
+    )
+    metals.append(
+        fetch_yf_commodity("은 선물", "SI=F", "$/oz")
+        or {"label": "은 선물", "value": None, "unit": "", "source": "yfinance 일시 조회 실패"}
+    )
+
     now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     msg = f"⛏️ 광물 선물가격\n조회시각: {now_kst} KST\n\n"
     for item in items:
+        msg += _format_mineral_row(item)
+    msg += "\n"  # 니켈 선물 아래 한 줄 띄움
+    for item in metals:
         msg += _format_mineral_row(item)
 
     await update.message.reply_text(msg)
