@@ -941,17 +941,17 @@ async def check_disclosures():
                 summary = summarize_disclosure(report_nm, body)
                 if summary:
                     summary_block = f"본문 요약: {summary}"
-                    # 계약기간이 있는 공시(공급계약 등)는 한 줄 띄우고 별도 표기
+                    # 계약기간이 있는 공시(공급계약 등)는 바로 다음 줄에 별도 표기
                     period = extract_contract_period(body)
                     if period:
-                        summary_block += f"\n\n계약기간:  {period}"
+                        summary_block += f"\n계약기간:  {period}"
                 else:
                     summary_block = "본문 요약: (요약 일시 실패 — 링크 참조)"
             link = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}"
-            msg = (f"📑 [주요 공시] {info['name']} ({info['ticker']}·{info['market']})\n"
+            msg = (f"[주요 공시] {info['name']} ({info['ticker']}·{info['market']})\n"
                    f"제목: {report_nm.strip()}\n"
                    f"제출일: {dt_fmt}\n"
-                   f"{summary_block}\n"
+                   f"{summary_block}\n\n"
                    f"Source:  {link}")
             await bot.send_message(chat_id=CHAT_ID, text=msg)
             sent_disclosures[rcept_no] = datetime.now(timezone.utc).timestamp()
