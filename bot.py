@@ -21,12 +21,16 @@ for stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 from dotenv import load_dotenv
+import warnings
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from datetime import datetime, timedelta, timezone, date
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from calendar import timegm
 from urllib.parse import urlparse
+
+# DART 공시 원문은 XML 헤더를 가진 HTML이라 html.parser 사용 시 경고 발생 → 억제
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 # ─────────────────────────────────────────────
 # 설정 (환경변수에서 로드)
@@ -838,6 +842,50 @@ def is_target_disclosure(report_nm):
     return any(kw.replace(" ", "") in nm for kw in DISCLOSURE_KEYWORDS)
 
 
+def fetch_disclosure_body(rcept_no):
+    """DART document.xml → 공시 원문 텍스트. 정정공시 등 원문 미제공(status 014)이면 None.
+    (외부 API 한계 — 일부 공시는 원본 파일을 제공하지 않음)"""
+    if not DART_API_KEY:
+        return None
+    try:
+        url = f"{DART_API}/document.xml?crtfc_key={DART_API_KEY}&rcept_no={rcept_no}"
+        raw = requests.get(url, timeout=20).content
+        if raw[:2] != b"PK":  # zip 시그니처 아님 = 에러 XML(014 등)
+            return None
+        z = zipfile.ZipFile(BytesIO(raw))
+        content = z.read(z.namelist()[0])
+        try:
+            t = content.decode("utf-8")
+        except UnicodeDecodeError:
+            t = content.decode("euc-kr", errors="replace")
+        text = BeautifulSoup(t, "html.parser").get_text(" ", strip=True)
+        return text[:4000] if text and len(text) > 30 else None
+    except Exception as e:
+        print(f"  ⚠️ 공시 본문({rcept_no}) 오류: {e}")
+        return None
+
+
+def summarize_disclosure(report_nm, body):
+    """공시 본문을 Claude Haiku로 2~3줄 한국어 요약 (핵심 수치 포함). 실패 시 None."""
+    if not body or len(body) < 50:
+        return None
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=320,
+            messages=[{"role": "user", "content": (
+                "다음은 한국 상장사 DART 공시 본문이야. 2~3줄로 핵심만 한국어로 요약해. "
+                "계약금액·계약상대방·계약기간·발행규모·발행조건·실적수치(매출/영업이익) 등 "
+                "핵심 숫자를 반드시 포함해. 요약문만 출력하고 군더더기 말은 절대 쓰지 마.\n"
+                f"공시제목: {report_nm}\n본문: {body[:3500]}"
+            )}]
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        print(f"  ⚠️ 공시 요약 오류: {e}")
+        return None
+
+
 async def check_disclosures():
     """2차전지 기업 DART 공시 폴링 → 7종 필터 → 새 공시 텔레그램 푸시.
     1차: 회사명 + 공시제목 + 접수일 + DART 링크."""
@@ -865,11 +913,22 @@ async def check_disclosures():
                 continue
             if not is_target_disclosure(report_nm):
                 continue
+            # 접수일 YYYYMMDD → yyyy-mm-dd
+            rd = item.get("rcept_dt", "")
+            dt_fmt = f"{rd[:4]}-{rd[4:6]}-{rd[6:8]}" if len(rd) == 8 else rd
+            # 본문 요약: 원문 미제공(정정 등)과 요약 API 실패를 구분
+            body = fetch_disclosure_body(rcept_no)
+            if body is None:
+                summary_line = "(원문 미제공 — 링크 참조)"
+            else:
+                summary = summarize_disclosure(report_nm, body)
+                summary_line = summary if summary else "(요약 일시 실패 — 링크 참조)"
             link = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}"
-            msg = (f"📑 [2차전지 공시] {info['name']} ({info['ticker']}·{info['market']})\n"
-                   f"{report_nm.strip()}\n"
-                   f"📅 {item.get('rcept_dt','')}  제출: {item.get('flr_nm','')}\n"
-                   f"🔗 {link}")
+            msg = (f"📑 [주요 공시] {info['name']} ({info['ticker']}·{info['market']})\n"
+                   f"제목: {report_nm.strip()}\n"
+                   f"제출일: {dt_fmt}\n"
+                   f"본문 요약: {summary_line}\n"
+                   f"Source:  {link}")
             await bot.send_message(chat_id=CHAT_ID, text=msg)
             sent_disclosures[rcept_no] = datetime.now(timezone.utc).timestamp()
             save_sent_disclosures()
