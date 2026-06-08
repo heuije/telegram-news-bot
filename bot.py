@@ -1074,6 +1074,18 @@ async def force_prices_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await bot.send_message(chat_id=CHAT_ID, text=f"⚠️ 가격 급변 알람\n{alert}")
 
 
+async def exchange_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """환율 조회 (USD/KRW·JPY·CNY, EUR/USD, 달러인덱스)"""
+    await update.message.reply_text("⏳ 환율 조회 중...")
+    now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    msg = f"💱 주요 환율\n조회시각: {now_kst} KST\n\n"
+    for name, ticker in FX.items():
+        row, _ = get_price_row(name, ticker)  # Forex는 24/5 거래라 평일 항상 데이터 있음
+        msg += row if row else f"❓ {name}: 데이터 없음\n"
+    msg += "\n↳ Source: yfinance (실시간, 전일 종가 대비)"
+    await update.message.reply_text(msg)
+
+
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global sent_links
     sent_links = {}
@@ -1719,6 +1731,8 @@ async def main():
     app.add_handler(CommandHandler("Mineral", mineral_command))
     app.add_handler(CommandHandler("oil", oil_command))
     app.add_handler(CommandHandler("Oil", oil_command))
+    app.add_handler(CommandHandler("exchange", exchange_command))
+    app.add_handler(CommandHandler("Exchange", exchange_command))
     app.add_handler(CommandHandler("diag", diag_command))
 
     news_counter = 0
