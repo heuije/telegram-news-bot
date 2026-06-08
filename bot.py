@@ -865,18 +865,35 @@ def fetch_disclosure_body(rcept_no):
         return None
 
 
+def extract_contract_period(body):
+    """공시 본문에서 계약기간 추출 (공급계약 등). 없으면 None.
+    DART 본문 구조: '계약기간 시작일 YYYY-MM-DD 종료일 YYYY-MM-DD'"""
+    if not body:
+        return None
+    m = re.search(r"계약기간\s*시작일\s*([\d.\-]+)\s*종료일\s*([\d.\-]+)", body)
+    if m:
+        start = m.group(1).strip("-.")
+        end = m.group(2).strip("-.")
+        if start and end:
+            return f"{start}~{end}"
+    return None
+
+
 def summarize_disclosure(report_nm, body):
-    """공시 본문을 Claude Haiku로 2~3줄 한국어 요약 (핵심 수치 포함). 실패 시 None."""
+    """공시 본문을 Claude Haiku로 1~2줄 한국어 요약 (핵심 수치 포함). 실패 시 None.
+    계약기간·부수조건(계약금·선급금)은 요약에서 제외 (계약기간은 별도 라인 표기)."""
     if not body or len(body) < 50:
         return None
     try:
         resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=320,
+            max_tokens=300,
             messages=[{"role": "user", "content": (
-                "다음은 한국 상장사 DART 공시 본문이야. 2~3줄로 핵심만 한국어로 요약해. "
-                "계약금액·계약상대방·계약기간·발행규모·발행조건·실적수치(매출/영업이익) 등 "
-                "핵심 숫자를 반드시 포함해. 요약문만 출력하고 군더더기 말은 절대 쓰지 마.\n"
+                "다음은 한국 상장사 DART 공시 본문이야. 1~2줄로 핵심만 한국어로 요약해. "
+                "계약상대방·계약금액·매출액대비·발행규모·실적수치(매출/영업이익) 등 핵심 숫자는 반드시 포함해. "
+                "단, 계약기간은 별도로 표기되니 요약에 넣지 말고, "
+                "계약금·선급금·대금지급조건 같은 부수 조건도 제외해. "
+                "요약문만 출력하고 군더더기 말은 절대 쓰지 마.\n"
                 f"공시제목: {report_nm}\n본문: {body[:3500]}"
             )}]
         )
@@ -919,15 +936,22 @@ async def check_disclosures():
             # 본문 요약: 원문 미제공(정정 등)과 요약 API 실패를 구분
             body = fetch_disclosure_body(rcept_no)
             if body is None:
-                summary_line = "(원문 미제공 — 링크 참조)"
+                summary_block = "본문 요약: (원문 미제공 — 링크 참조)"
             else:
                 summary = summarize_disclosure(report_nm, body)
-                summary_line = summary if summary else "(요약 일시 실패 — 링크 참조)"
+                if summary:
+                    summary_block = f"본문 요약: {summary}"
+                    # 계약기간이 있는 공시(공급계약 등)는 한 줄 띄우고 별도 표기
+                    period = extract_contract_period(body)
+                    if period:
+                        summary_block += f"\n\n계약기간:  {period}"
+                else:
+                    summary_block = "본문 요약: (요약 일시 실패 — 링크 참조)"
             link = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}"
             msg = (f"📑 [주요 공시] {info['name']} ({info['ticker']}·{info['market']})\n"
                    f"제목: {report_nm.strip()}\n"
                    f"제출일: {dt_fmt}\n"
-                   f"본문 요약: {summary_line}\n"
+                   f"{summary_block}\n"
                    f"Source:  {link}")
             await bot.send_message(chat_id=CHAT_ID, text=msg)
             sent_disclosures[rcept_no] = datetime.now(timezone.utc).timestamp()
