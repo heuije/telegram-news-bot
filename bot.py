@@ -9,7 +9,9 @@ import os
 import re
 import sys
 import time
-from io import StringIO
+import zipfile
+import xml.etree.ElementTree as ETree  # 주의: ET는 이미 미국 동부시간 timezone 변수
+from io import BytesIO, StringIO
 from pathlib import Path
 
 # Windows cp949 콘솔에서도 이모지 출력이 깨지지 않도록 stdout/stderr를 UTF-8로 고정
@@ -35,6 +37,7 @@ load_dotenv(BASE_DIR / ".env", override=True)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+DART_API_KEY = os.getenv("DART_API_KEY")  # 선택: 없으면 DART 공시 모니터링만 비활성
 
 missing = [k for k, v in {
     "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
@@ -739,6 +742,141 @@ def fetch_treasury_yields():
     except Exception as e:
         print(f"  ⚠️ Treasury 수익률 조회 오류: {e}")
         return None
+
+
+# ─────────────────────────────────────────────
+# DART 전자공시 모니터링 (2차전지 기업)
+# ─────────────────────────────────────────────
+DART_API = "https://opendart.fss.or.kr/api"
+BATTERY_CSV = str(BASE_DIR / "battery_companies.csv")
+SENT_DISCLOSURES_FILE = str(BASE_DIR / "sent_disclosures.json")
+
+# 모니터링할 공시 유형 (report_nm 부분일치 키워드; 공백 제거 후 비교)
+DISCLOSURE_KEYWORDS = [
+    "결산실적공시예고",                              # 실적 발표일 예고
+    "분기보고서", "반기보고서", "사업보고서",         # 정기 실적
+    "기업설명회",                                    # IR 개최
+    "영업(잠정)실적", "잠정실적",                     # 예상/잠정 분기 실적
+    "전환사채", "교환사채", "신주인수권부사채",       # 사채 발행
+    "상환전환우선주", "전환우선주", "사채권발행",      # RCPS 등
+    "단일판매", "공급계약",                          # 단일판매·공급계약 체결
+    "유상증자", "무상증자",                          # 주요사항보고(증자)
+    "타법인주식", "출자증권",                        # 타법인주식 취득결정
+]
+
+# 봇 시작 시 1회 채워짐: {corp_code: {"name","ticker","market"}}
+battery_corps = {}
+
+
+def load_battery_companies():
+    """industry_2차전지.csv → [(ticker, name, market), ...]"""
+    rows = []
+    try:
+        with open(BATTERY_CSV, encoding="utf-8-sig") as f:
+            for r in csv.DictReader(f):
+                ticker = (r.get("티커") or "").strip()
+                name = (r.get("기업명") or "").strip()
+                market = (r.get("시장") or "").strip()
+                if ticker and len(ticker) == 6:
+                    rows.append((ticker, name, market))
+    except Exception as e:
+        print(f"  ⚠️ 2차전지 CSV 로드 오류: {e}")
+    return rows
+
+
+def build_battery_corp_index():
+    """DART corpCode.xml 다운로드 → 2차전지 티커의 corp_code 매핑.
+    battery_corps 전역을 채움. 봇 시작 시 1회 호출."""
+    global battery_corps
+    if not DART_API_KEY:
+        print("DART_API_KEY 없음 → 공시 모니터링 비활성")
+        return
+    companies = load_battery_companies()
+    tickers = {t: (n, m) for t, n, m in companies}
+    try:
+        raw = requests.get(f"{DART_API}/corpCode.xml?crtfc_key={DART_API_KEY}", timeout=30).content
+        z = zipfile.ZipFile(BytesIO(raw))
+        root = ETree.fromstring(z.read(z.namelist()[0]))
+    except Exception as e:
+        print(f"  ⚠️ DART corpCode 로드 오류: {e}")
+        return
+    idx = {}
+    for it in root.iter("list"):
+        sc = (it.findtext("stock_code") or "").strip()
+        cc = (it.findtext("corp_code") or "").strip()
+        if sc in tickers and cc:
+            name, market = tickers[sc]
+            idx[cc] = {"name": name, "ticker": sc, "market": market}
+    battery_corps = idx
+    print(f"DART 2차전지 기업 매핑: {len(battery_corps)}/{len(companies)}개")
+
+
+def load_sent_disclosures():
+    """전송한 공시 rcept_no 기록. 14일 이상 된 항목 자동 정리."""
+    if os.path.exists(SENT_DISCLOSURES_FILE):
+        try:
+            with open(SENT_DISCLOSURES_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            cutoff = datetime.now(timezone.utc).timestamp() - (14 * 86400)
+            return {k: v for k, v in data.items() if v > cutoff}
+        except Exception:
+            pass
+    return {}
+
+
+def save_sent_disclosures():
+    with open(SENT_DISCLOSURES_FILE, "w", encoding="utf-8") as f:
+        json.dump(sent_disclosures, f)
+
+
+sent_disclosures = load_sent_disclosures()  # {rcept_no: timestamp}
+
+
+def is_target_disclosure(report_nm):
+    """report_nm이 모니터링 대상 7종 공시에 해당하는지."""
+    nm = (report_nm or "").replace(" ", "")
+    return any(kw.replace(" ", "") in nm for kw in DISCLOSURE_KEYWORDS)
+
+
+async def check_disclosures():
+    """2차전지 기업 DART 공시 폴링 → 7종 필터 → 새 공시 텔레그램 푸시.
+    1차: 회사명 + 공시제목 + 접수일 + DART 링크."""
+    if not DART_API_KEY or not battery_corps:
+        return
+    now_kst = datetime.now(KST)
+    bgn = (now_kst - timedelta(days=2)).strftime("%Y%m%d")   # 자정 경계·다운타임 대비 2일
+    end = now_kst.strftime("%Y%m%d")
+    sent_count = 0
+    errors = 0
+    for cc, info in battery_corps.items():
+        url = (f"{DART_API}/list.json?crtfc_key={DART_API_KEY}&corp_code={cc}"
+               f"&bgn_de={bgn}&end_de={end}&page_count=50")
+        try:
+            d = requests.get(url, timeout=15).json()
+        except Exception:
+            errors += 1
+            continue
+        if d.get("status") != "000":  # 013=데이터없음 등은 정상 스킵
+            continue
+        for item in d.get("list", []):
+            rcept_no = item.get("rcept_no", "")
+            report_nm = item.get("report_nm", "")
+            if not rcept_no or rcept_no in sent_disclosures:
+                continue
+            if not is_target_disclosure(report_nm):
+                continue
+            link = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}"
+            msg = (f"📑 [2차전지 공시] {info['name']} ({info['ticker']}·{info['market']})\n"
+                   f"{report_nm.strip()}\n"
+                   f"📅 {item.get('rcept_dt','')}  제출: {item.get('flr_nm','')}\n"
+                   f"🔗 {link}")
+            await bot.send_message(chat_id=CHAT_ID, text=msg)
+            sent_disclosures[rcept_no] = datetime.now(timezone.utc).timestamp()
+            save_sent_disclosures()
+            sent_count += 1
+            await asyncio.sleep(1)
+    print(f"[{now_kst.strftime('%Y-%m-%d %H:%M')}] DART 공시 체크 완료: "
+          f"전송={sent_count} | 기업={len(battery_corps)} | 오류={errors}")
 
 
 # ─────────────────────────────────────────────
@@ -1480,9 +1618,13 @@ async def main():
     print(f"Forex 시장: {'운영' if is_forex_market_open() else '휴장'}", flush=True)
     print(f"전송 기록: {len(sent_links)}개 로드됨", flush=True)
 
+    # DART 2차전지 기업 corp_code 매핑 (1회)
+    build_battery_corp_index()
+
     # 시작 시 즉시 실행
     await check_feeds()
     await check_prices()
+    await check_disclosures()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("update", update_command))
@@ -1506,6 +1648,7 @@ async def main():
             await asyncio.sleep(600)
             news_counter += 1
             await check_feeds()
+            await check_disclosures()      # 10분마다 DART 공시 폴링
 
             if news_counter >= 18:
                 await check_prices()

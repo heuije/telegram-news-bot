@@ -5,3 +5,4 @@ venv/
 sent_links.json
 alert_state.json
 test_run*.log
+sent_disclosures.json
