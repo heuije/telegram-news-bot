@@ -310,6 +310,30 @@ def save_sent_links():
 sent_links = load_sent_links()  # dict: {link: timestamp}
 
 # ─────────────────────────────────────────────
+# 급변 알람 상태 (최초 1회만 발송, 임계 아래로 내려가면 재무장)
+# ─────────────────────────────────────────────
+ALERT_STATE_FILE = str(BASE_DIR / "alert_state.json")
+
+
+def load_alert_state():
+    """현재 '알람 발령 중'인 자산 라벨 set 로드."""
+    if os.path.exists(ALERT_STATE_FILE):
+        try:
+            with open(ALERT_STATE_FILE, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+
+def save_alert_state():
+    with open(ALERT_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(alerted_assets), f, ensure_ascii=False)
+
+
+alerted_assets = load_alert_state()  # set of label currently in alert
+
+# ─────────────────────────────────────────────
 # 진단 카운터 (매 check_feeds 호출마다 리셋)
 # ─────────────────────────────────────────────
 diag = {
@@ -734,8 +758,9 @@ UPDATE_INDICES = [
 
 
 def get_index_row(flag, name, ticker):
-    """지수 한 줄 + 급변 알람: (row, alert) 반환.
-    전일 대비 |변동률| >= 5%면 alert 문자열, 아니면 None."""
+    """지수 한 줄 + 알람용 item: (row, item) 반환.
+    item = {"label": "<국기> <이름>", "change_pct": 전일대비%} 또는 None.
+    급변 알람 판정/상태관리는 collect_surge_alerts가 담당."""
     try:
         hist = yf.Ticker(ticker).history(period="5d")
         hist = hist.dropna(subset=["Close"])
@@ -752,11 +777,8 @@ def get_index_row(flag, name, ticker):
         else:
             arrow = "▬"
         row = f"{flag} {arrow} {name}: {cur:,.2f} ({sign}{chg:.2f}%)\n"
-        alert = None
-        if abs(chg) >= 5:
-            direction = "🔺 급등" if chg > 0 else "▼ 급락"
-            alert = f"{direction} {flag} {name} {round(chg, 2)}% 변동!"
-        return row, alert
+        item = {"label": f"{flag} {name}", "change_pct": chg}
+        return row, item
     except Exception as e:
         print(f"  ⚠️ {name} 지수 오류: {e}")
         return f"❓ {flag} {name}: 조회 실패\n", None
@@ -767,15 +789,15 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ 글로벌 지수 조회 중...")
     now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     msg = f"📈 글로벌 주요 지수\n조회시각: {now_kst} KST\n\n"
-    alerts = []
+    index_items = []
     for flag, name, ticker in UPDATE_INDICES:
-        row, alert = get_index_row(flag, name, ticker)
+        row, item = get_index_row(flag, name, ticker)
         msg += row
-        if alert:
-            alerts.append(alert)
+        if item:
+            index_items.append(item)
     msg += "\n↳ Source: yfinance (지수 실시간, 전일 종가 대비)"
     await update.message.reply_text(msg)
-    for alert in alerts:
+    for alert in collect_surge_alerts(index_items):
         await update.message.reply_text(f"⚠️ 가격 급변 알람\n{alert}")
 
 
@@ -1154,18 +1176,38 @@ def _is_gfex_trading_hours():
     return any(start <= minutes < end for start, end in sessions)
 
 
-def collect_surge_alerts(items, threshold=5.0):
-    """item dict 리스트에서 전일 대비 |변동률| >= threshold(%)인 항목을
-    기존 양식의 급변 알람 문자열 리스트로 반환."""
-    alerts = []
+def collect_surge_alerts(items, threshold=5.0, release=4.0):
+    """item 리스트에서 |변동률| >= threshold(%)인 항목을 급변 알람으로 반환.
+    단, '최초 1회만' 발송: 이미 알람 발령 중인 자산은 스킵.
+    |변동률|이 release(%) 아래로 내려가면 상태 해제(재무장) → 다음에 다시 넘으면 재발송.
+    threshold~release 구간(4~5%)은 경계 진동 방지용 히스테리시스(상태 유지)."""
+    global alerted_assets
+    new_alerts = []
+    changed = False
     for it in items:
         if not it:
             continue
+        label = it.get("label")
         cp = it.get("change_pct")
-        if cp is not None and abs(cp) >= threshold:
-            direction = "🔺 급등" if cp > 0 else "▼ 급락"
-            alerts.append(f"{direction} {it['label']} {round(cp, 2)}% 변동!")
-    return alerts
+        if not label or cp is None:
+            continue
+        mag = abs(cp)
+        if mag >= threshold:
+            if label not in alerted_assets:
+                direction = "🔺 급등" if cp > 0 else "▼ 급락"
+                new_alerts.append(f"{direction} {label} {round(cp, 2)}% 변동!")
+                alerted_assets.add(label)
+                changed = True
+            # 이미 발령 중이면 스킵 (반복 방지)
+        elif mag < release:
+            # 임계 아래로 충분히 내려감 → 재무장
+            if label in alerted_assets:
+                alerted_assets.discard(label)
+                changed = True
+        # release~threshold 구간은 상태 유지 (진동 방지)
+    if changed:
+        save_alert_state()
+    return new_alerts
 
 
 def _format_mineral_row(item):
@@ -1331,13 +1373,14 @@ async def check_threshold_alerts():
     """자동 모니터링: 글로벌 지수(/update) + 광물(/mineral) + 유가(/oil)를
     조회해 전일 대비 5% 이상 변동 항목을 급변 알람으로 자동 발송."""
     alerts = []
-    # 지수 7종
+    # 지수 7종 (알람용 item)
+    items = []
     for flag, name, ticker in UPDATE_INDICES:
-        _, alert = get_index_row(flag, name, ticker)
-        if alert:
-            alerts.append(alert)
+        _, item = get_index_row(flag, name, ticker)
+        if item:
+            items.append(item)
     # 광물/귀금속 5종 + 유가 2종
-    items = [
+    items += [
         fetch_lithium_carbonate_eastmoney(),
         fetch_yf_commodity("구리 선물", "HG=F", "$/lb"),
         fetch_tradingeconomics_metal("nickel", "니켈 선물"),
@@ -1346,11 +1389,12 @@ async def check_threshold_alerts():
         get_oil_item(["wti", "wti-crude"], "CL=F", "WTI Crude"),       # 유가는 12h 전 대비
         get_oil_item(["brent", "brent-crude", "brent-oil"], "BZ=F", "Brent Crude"),
     ]
-    alerts += collect_surge_alerts(items)
+    # collect_surge_alerts가 '최초 1회만' 상태관리까지 처리
+    alerts = collect_surge_alerts(items)
     for alert in alerts:
         await bot.send_message(chat_id=CHAT_ID, text=f"⚠️ 가격 급변 알람\n{alert}")
     now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-    print(f"[{now_kst}] 급변 알람 체크 완료: {len(alerts)}건")
+    print(f"[{now_kst}] 급변 알람 체크 완료: {len(alerts)}건 신규 (발령중 {len(alerted_assets)}건)")
 
 
 async def rate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

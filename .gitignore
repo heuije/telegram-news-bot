@@ -3,3 +3,5 @@
 __pycache__/
 venv/
 sent_links.json
+alert_state.json
+test_run*.log
