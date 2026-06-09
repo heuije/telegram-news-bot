@@ -933,26 +933,27 @@ async def check_disclosures():
             # 접수일 YYYYMMDD → yyyy-mm-dd
             rd = item.get("rcept_dt", "")
             dt_fmt = f"{rd[:4]}-{rd[4:6]}-{rd[6:8]}" if len(rd) == 8 else rd
-            # 본문 요약: 원문 미제공(정정 등)과 요약 API 실패를 구분
+            # 본문 요약: 본문이 확보되고 요약 성공한 경우에만 표시.
+            # 거래소 수시공시(공급계약·IR·잠정실적 등)는 발생 직후 DART에 원문 미등록(시차)이라
+            # 제목+링크만 발송. 본문 확보되는 공시(주요사항보고서 등)는 요약 + 계약기간 표시.
             body = fetch_disclosure_body(rcept_no)
-            if body is None:
-                summary_block = "본문 요약: (원문 미제공 — 링크 참조)"
-            else:
+            summary_block = None
+            if body is not None:
                 summary = summarize_disclosure(report_nm, body)
                 if summary:
                     summary_block = f"본문 요약: {summary}"
-                    # 계약기간이 있는 공시(공급계약 등)는 바로 다음 줄에 별도 표기
                     period = extract_contract_period(body)
                     if period:
                         summary_block += f"\n계약기간:  {period}"
-                else:
-                    summary_block = "본문 요약: (요약 일시 실패 — 링크 참조)"
             link = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}"
-            msg = (f"[주요 공시] {info['name']} ({info['ticker']}·{info['market']})\n"
-                   f"제목: {report_nm.strip()}\n"
-                   f"제출일: {dt_fmt}\n"
-                   f"{summary_block}\n\n"
-                   f"Source:  {link}")
+            header = (f"[주요 공시] {info['name']} ({info['ticker']}·{info['market']})\n"
+                      f"제목: {report_nm.strip()}\n"
+                      f"제출일: {dt_fmt}\n")
+            if summary_block:
+                msg = f"{header}{summary_block}\n\nSource:  {link}"
+            else:
+                # 제목+링크만 (원문 미제공 또는 요약 불가)
+                msg = f"{header}\nSource:  {link}"
             await bot.send_message(chat_id=CHAT_ID, text=msg)
             sent_disclosures[rcept_no] = datetime.now(timezone.utc).timestamp()
             save_sent_disclosures()
