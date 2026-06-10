@@ -27,7 +27,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from datetime import datetime, timedelta, timezone, date
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from calendar import timegm
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 
 # DART 공시 원문은 XML 헤더를 가진 HTML이라 html.parser 사용 시 경고 발생 → 억제
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
@@ -440,6 +440,37 @@ def try_fetch_article(url):
         return None
 
 
+def resolve_google_news_url(link):
+    """Google News RSS 링크를 원문 URL로 디코딩 (batchexecute API).
+    구글뉴스 링크가 아니면 그대로 반환. 실패 시에도 원래 링크 반환(안전).
+    주의: Google 비공식 API라 구조 변경 시 깨질 수 있음 → 그땐 자동으로 원래 링크 유지."""
+    if "news.google.com" not in link or "/articles/" not in link:
+        return link
+    try:
+        gid = link.split("/articles/")[1].split("?")[0]
+        r = requests.get(f"https://news.google.com/rss/articles/{gid}",
+                         headers=HEADERS, timeout=12)
+        div = BeautifulSoup(r.text, "html.parser").select_one("c-wiz > div")
+        if not div or not div.get("data-n-a-sg"):
+            return link
+        req = ["Fbv4je",
+               '["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",null,1,'
+               'null,null,null,null,null,0,1],"X","X",1,[1,1,1],1,1,null,0,0,null,0],'
+               f'"{div.get("data-n-a-id")}",{div.get("data-n-a-ts")},'
+               f'"{div.get("data-n-a-sg")}"]']
+        payload = urlencode({"f.req": json.dumps([[req]])})
+        h = {"content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+             "User-Agent": HEADERS["User-Agent"]}
+        rr = requests.post("https://news.google.com/_/DotsSplashUi/data/batchexecute",
+                          headers=h, data=payload, timeout=12)
+        arr = json.loads(rr.text.split("\n\n")[1])
+        url = json.loads(arr[0][2])[1]
+        return url if url and url.startswith("http") else link
+    except Exception as e:
+        print(f"  ⚠️ 구글뉴스 링크 디코딩 실패(원래 링크 사용): {str(e)[:60]}")
+        return link
+
+
 # ─────────────────────────────────────────────
 # Claude 요약 / 제목 번역
 # ─────────────────────────────────────────────
@@ -575,15 +606,17 @@ async def check_feeds():
 
                 # Claude 요약 및 전송
                 korean_summary = summarize(title, body)
+                # 구글뉴스 우회 링크는 원문 URL로 변환 (중복방지 키는 원래 link 유지)
+                out_link = resolve_google_news_url(link)
                 if korean_summary:
-                    message = f"{title}\n\n{korean_summary}\n\n {link}"
+                    message = f"{title}\n\n{korean_summary}\n\n {out_link}"
                 else:
                     # 본문 확보 실패 (구글뉴스 우회 등) → 제목만 한국어로 번역, 본문 생략
                     korean_title = translate_title(title)
                     if korean_title and korean_title != title:
-                        message = f"{korean_title}\n(원제: {title})\n\n {link}"
+                        message = f"{korean_title}\n(원제: {title})\n\n {out_link}"
                     else:
-                        message = f"{title}\n\n {link}"
+                        message = f"{title}\n\n {out_link}"
 
                 await bot.send_message(chat_id=CHAT_ID, text=message)
                 sent_links[link] = datetime.now(timezone.utc).timestamp()
