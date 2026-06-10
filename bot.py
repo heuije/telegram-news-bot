@@ -174,8 +174,8 @@ RSS_FEEDS = [
     # ── EV 전문 미디어 ──────────────────────────────────────────
     "https://www.electrive.com/feed/",
     "https://electrek.co/feed/",
-    # insideevs.com/rss/articles/ → 404 발생, Google News 경유로 대체
-    "https://news.google.com/rss/search?q=site:insideevs.com&hl=en-US&gl=US&ceid=US:en",
+    # insideevs.com/feed/ 직접 RSS 복구됨 → 원문 직접 링크 (Google 경유 제거)
+    "https://insideevs.com/feed/",
     "https://cleantechnica.com/feed/",
     # ── 배터리·에너지저장 전문 ──────────────────────────────────
     "https://batteriesnews.com/feed/",
