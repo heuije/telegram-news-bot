@@ -609,14 +609,15 @@ async def check_feeds():
                 # 구글뉴스 우회 링크는 원문 URL로 변환 (중복방지 키는 원래 link 유지)
                 out_link = resolve_google_news_url(link)
                 if korean_summary:
-                    message = f"{title}\n\n{korean_summary}\n\n {out_link}"
+                    # 한국어 요약만 (영문 제목 생략)
+                    message = f"{korean_summary}\n\n{out_link}"
                 else:
-                    # 본문 확보 실패 (구글뉴스 우회 등) → 제목만 한국어로 번역, 본문 생략
+                    # 본문 확보 실패 → 제목만 한국어로 번역 (원제 생략)
                     korean_title = translate_title(title)
                     if korean_title and korean_title != title:
-                        message = f"{korean_title}\n(원제: {title})\n\n {out_link}"
+                        message = f"{korean_title}\n\n{out_link}"
                     else:
-                        message = f"{title}\n\n {out_link}"
+                        message = f"{title}\n\n{out_link}"
 
                 await bot.send_message(chat_id=CHAT_ID, text=message)
                 sent_links[link] = datetime.now(timezone.utc).timestamp()
