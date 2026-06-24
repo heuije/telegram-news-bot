@@ -1113,7 +1113,7 @@ async def exchange_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """환율 조회 (USD/KRW·JPY·CNY, EUR/USD, 달러인덱스)"""
     await update.message.reply_text("⏳ 환율 조회 중...")
     now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-    msg = f"💱 주요 환율\n조회시각: {now_kst} KST\n\n"
+    msg = f"◾ 주요 환율\n조회시각: {now_kst} KST\n\n"
     for name, ticker in FX.items():
         row, _ = get_price_row(name, ticker)  # Forex는 24/5 거래라 평일 항상 데이터 있음
         msg += row if row else f"❓ {name}: 데이터 없음\n"
