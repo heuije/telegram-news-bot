@@ -717,7 +717,7 @@ async def check_prices():
 
     # ── 환율 (Forex 운영 시간에만) ─────────────────────────
     if fx_open:
-        fx_report = f"💱 주요 환율 (실시간)\n{now_kst} KST / {now_et.strftime('%H:%M')} ET\n\n"
+        fx_report = f"주요 환율 (실시간)\n{now_kst} KST / {now_et.strftime('%H:%M')} ET\n\n"
         has_data = False
         for name, ticker in FX.items():
             row, alert = get_price_row(name, ticker)
@@ -1096,7 +1096,7 @@ async def force_prices_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await bot.send_message(chat_id=CHAT_ID, text=index_report)
     await asyncio.sleep(1)
 
-    fx_report = f"💱 주요 환율 (강제 조회)\n{now}\n\n"
+    fx_report = f"주요 환율 (강제 조회)\n{now}\n\n"
     for name, ticker in FX.items():
         row, alert = get_price_row(name, ticker)
         if row:
@@ -1131,6 +1131,71 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # 광물 선물가격 (/mineral) + 국제 유가 (/oil) 명령어
 # ─────────────────────────────────────────────
+def fetch_lithium_carbonate_sina():
+    """탄산리튬 주력 계약 가격 - sina 선물 시세 (광저우선물거래소 GFEX).
+    nf_LC0 = 주력연속(主力连续) 계약. 전일 결산가(昨结算) 대비 변동률.
+    eastmoney가 해외(GCP) IP를 차단해 1순위 소스로 사용. 필드 순서:
+    0명칭 1시각 2시가 3고가 4저가 5전일종가 6매수 7매도 8현재가 9결산 10전일결산
+    11매수량 12매도량 13미결제약정 14거래량 15거래소 16품종 17일자"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 AppleWebKit/537.36 Chrome/122.0.0.0",
+        "Referer": "https://finance.sina.com.cn",
+    }
+    # 주력연속 + 향후 14개월 월물 코드를 함께 조회해 LC0가 어느 월물인지(미결제약정 일치) 식별
+    now = datetime.now(KST)
+    months = []
+    y, m = now.year, now.month
+    for _ in range(14):
+        months.append(f"LC{y % 100:02d}{m:02d}")
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+    codes = ["LC0"] + months
+    url = "https://hq.sinajs.cn/list=" + ",".join(f"nf_{c}" for c in codes)
+    try:
+        r = requests.get(url, headers=headers, timeout=(5, 10))
+        r.encoding = "gbk"
+        rows = {}
+        for line in r.text.strip().split("\n"):
+            if '="' not in line or '=""' in line:
+                continue
+            key = line.split("=")[0].replace("var hq_str_nf_", "").strip()
+            f = line.split('"')[1].split(",")
+            if len(f) < 18:
+                continue
+            rows[key] = f
+        main = rows.get("LC0")
+        if not main:
+            return None
+        last = float(main[8])
+        prev_settle = float(main[10])
+        if last <= 0:
+            return None
+        change_pct = (last - prev_settle) / prev_settle * 100 if prev_settle > 0 else None
+        # LC0가 추종하는 월물 식별 (미결제약정·현재가 일치)
+        code = "LC0"
+        for k, f in rows.items():
+            if k != "LC0" and f[13] == main[13] and f[8] == main[8]:
+                code = k.lower()
+                break
+        return {
+            "label": f"탄산리튬 {code} (중국 탄산리튬 선물가격)",
+            "value": last,
+            "unit": "¥/t",
+            "change_pct": change_pct,
+            "source": "sina.com.cn (GFEX 주력연속)",
+            "is_realtime": True,
+        }
+    except Exception as e:
+        print(f"  ⚠️ 탄산리튬(sina) 조회 오류: {e}")
+        return None
+
+
+def fetch_lithium_carbonate():
+    """탄산리튬: sina 1순위 → eastmoney 폴백."""
+    return fetch_lithium_carbonate_sina() or fetch_lithium_carbonate_eastmoney()
+
+
 def fetch_lithium_carbonate_eastmoney():
     """탄산리튬 주력 계약 가격 - eastmoney (광저우선물거래소 m:225).
     특정 월물을 하드코딩하지 않고, 거래량(f6) 1위 'lc' 계약을 자동 선택해
@@ -1142,10 +1207,10 @@ def fetch_lithium_carbonate_eastmoney():
         "https://push2.eastmoney.com/api/qt/clist/get"
         "?fs=m:225&fields=f12,f14,f2,f3,f6&pn=1&pz=60"
     )
-    attempts = 4  # eastmoney 간헐적 빈 응답 대비 재시도
+    attempts = 2  # eastmoney 간헐적 빈 응답 대비 재시도 (GCP 해외 IP는 접속 차단되는 경우가 있어 짧게)
     for attempt in range(attempts):
         try:
-            r = requests.get(list_url, headers=em_headers, timeout=15)
+            r = requests.get(list_url, headers=em_headers, timeout=(5, 10))
             data = (r.json() or {}).get("data") or {}
             diff = data.get("diff") or {}
             rows = diff.values() if isinstance(diff, dict) else diff
@@ -1556,7 +1621,7 @@ async def mineral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     items = []
 
     # 1) 탄산리튬 — eastmoney GFEX 주력 계약 (중국 탄산리튬 선물가격)
-    li = fetch_lithium_carbonate_eastmoney()
+    li = fetch_lithium_carbonate()
     if li is None:
         if _is_gfex_trading_hours():
             # 거래시간인데 None → 실제 조회 실패
@@ -1564,7 +1629,7 @@ async def mineral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "label": "탄산리튬 (중국 탄산리튬 선물가격)",
                 "value": None,
                 "unit": "",
-                "source": "eastmoney.com 일시 조회 실패",
+                "source": "sina/eastmoney 일시 조회 실패",
             }
         else:
             # 거래시간 외 → 거래소 휴장
@@ -1649,7 +1714,7 @@ async def check_threshold_alerts():
             items.append(item)
     # 광물/귀금속 5종 + 유가 2종
     items += [
-        fetch_lithium_carbonate_eastmoney(),
+        fetch_lithium_carbonate(),
         fetch_yf_commodity("구리 선물", "HG=F", "$/lb"),
         fetch_tradingeconomics_metal("nickel", "니켈 선물"),
         fetch_yf_commodity("금 선물", "GC=F", "$/oz"),
